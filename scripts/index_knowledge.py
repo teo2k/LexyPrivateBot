@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import List, Optional
 
 from tqdm import tqdm as tqdm_sync
-from pinecone.exceptions import PineconeApiException  # если не используешь, можно удалить
 
 from app.services.text_extractor import extract_text
 from app.integrations.openai_client import get_embedding
@@ -19,7 +18,8 @@ CHUNK_SIZE = 1800
 BATCH_SIZE = 50
 MAX_RETRIES = 5
 BASE_DELAY = 2.0
-CONCURRENCY = 10      # одновременно 10 запросов к OpenAI
+CONCURRENCY = 10          # одновременно 10 запросов к OpenAI
+EMBED_TIMEOUT = 60        # таймаут на один запрос эмбеддинга (секунд)
 
 
 @dataclass
@@ -73,11 +73,20 @@ def make_vector_id(file_path: Path, chunk_idx: int) -> str:
 async def get_embedding_with_retry(text: str) -> Optional[List[float]]:
     for attempt in range(MAX_RETRIES):
         try:
-            return await get_embedding(text)
+            # таймаут на запрос к OpenAI
+            return await asyncio.wait_for(
+                get_embedding(text),
+                timeout=EMBED_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            delay = BASE_DELAY * (attempt + 1)
+            print(f"[WARN] get_embedding timeout, retry через {delay}s")
+            await asyncio.sleep(delay)
         except Exception as e:
             delay = BASE_DELAY * (attempt + 1)
             print(f"[WARN] get_embedding ошибка: {e}, retry через {delay}s")
             await asyncio.sleep(delay)
+
     print("[ERROR] эмбеддинг не получен, пропуск чанка.")
     return None
 
@@ -95,20 +104,19 @@ def upsert_with_retry(index, batch):
     print(f"[ERROR] batch ({len(batch)}) пропущен.")
 
 
-async def process_chunk_item(semaphore: asyncio.Semaphore, item: ChunkItem):
-    async with semaphore:
-        emb = await get_embedding_with_retry(item.text)
-        if emb is None:
-            return None
+async def process_chunk_item(item: ChunkItem):
+    emb = await get_embedding_with_retry(item.text)
+    if emb is None:
+        return None
 
-        return {
-            "id": make_vector_id(item.file_path, item.chunk_index),
-            "values": emb,
-            "metadata": {
-                **item.metadata_base,
-                "chunk_index": item.chunk_index,
-            }
+    return {
+        "id": make_vector_id(item.file_path, item.chunk_index),
+        "values": emb,
+        "metadata": {
+            **item.metadata_base,
+            "chunk_index": item.chunk_index,
         }
+    }
 
 
 async def main():
@@ -132,33 +140,44 @@ async def main():
 
         for i, ch in enumerate(chunks):
             all_chunks.append(
-                ChunkItem(file_path=file_path, chunk_index=i, text=ch, metadata_base=meta)
+                ChunkItem(
+                    file_path=file_path,
+                    chunk_index=i,
+                    text=ch,
+                    metadata_base=meta
+                )
             )
 
     print(f"Всего чанков: {len(all_chunks)}")
 
     # -------------------------------
-    # 2) ПАРАЛЛЕЛЬНО СЧИТАЕМ ЭМБЕДДИНГИ
+    # 2) ПАРАЛЛЕЛЬНО СЧИТАЕМ ЭМБЕДДИНГИ (БАТЧАМИ)
     # -------------------------------
-    semaphore = asyncio.Semaphore(CONCURRENCY)
     print("Получаю эмбеддинги...")
 
-    tasks = [
-        asyncio.create_task(process_chunk_item(semaphore, item))
-        for item in all_chunks
-    ]
-
     results = []
-    # tqdm здесь обычный синхронный, но работает по мере выполнения корутин
-    for coro in tqdm_sync(
-        asyncio.as_completed(tasks),
-        total=len(tasks),
+    pbar = tqdm_sync(
+        total=len(all_chunks),
         desc="Эмбеддинги",
-        unit="chunk",
-    ):
-        res = await coro
-        if res is not None:
-            results.append(res)
+        unit="chunk"
+    )
+
+    # обрабатываем по CONCURRENCY чанков за раз
+    for i in range(0, len(all_chunks), CONCURRENCY):
+        batch_items = all_chunks[i:i + CONCURRENCY]
+
+        # запускаем задачи на текущий батч
+        tasks = [process_chunk_item(item) for item in batch_items]
+        batch_results = await asyncio.gather(*tasks)
+
+        for res in batch_results:
+            if res is not None:
+                results.append(res)
+
+        # обновляем прогресс на количество обработанных чанков
+        pbar.update(len(batch_items))
+
+    pbar.close()
 
     print(f"Эмбеддингов получено: {len(results)}")
 
