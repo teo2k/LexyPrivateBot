@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-from tqdm.asyncio import tqdm
 from tqdm import tqdm as tqdm_sync
-from pinecone.exceptions import PineconeApiException
+from pinecone.exceptions import PineconeApiException  # если не используешь, можно удалить
 
 from app.services.text_extractor import extract_text
 from app.integrations.openai_client import get_embedding
@@ -96,21 +95,20 @@ def upsert_with_retry(index, batch):
     print(f"[ERROR] batch ({len(batch)}) пропущен.")
 
 
-async def embed_worker(semaphore, items, results):
+async def process_chunk_item(semaphore: asyncio.Semaphore, item: ChunkItem):
     async with semaphore:
-        for item in items:
-            emb = await get_embedding_with_retry(item.text)
-            if emb is None:
-                continue
+        emb = await get_embedding_with_retry(item.text)
+        if emb is None:
+            return None
 
-            results.append({
-                "id": make_vector_id(item.file_path, item.chunk_index),
-                "values": emb,
-                "metadata": {
-                    **item.metadata_base,
-                    "chunk_index": item.chunk_index,
-                }
-            })
+        return {
+            "id": make_vector_id(item.file_path, item.chunk_index),
+            "values": emb,
+            "metadata": {
+                **item.metadata_base,
+                "chunk_index": item.chunk_index,
+            }
+        }
 
 
 async def main():
@@ -121,7 +119,7 @@ async def main():
 
     print(f"Найдено файлов: {len(pdf_files)}")
 
-    all_chunks = []
+    all_chunks: List[ChunkItem] = []
 
     for file_path in tqdm_sync(pdf_files, desc="Чтение PDF", unit="file"):
         text = extract_text(file_path).strip()
@@ -134,7 +132,7 @@ async def main():
 
         for i, ch in enumerate(chunks):
             all_chunks.append(
-                ChunkItem(file_path, i, ch, meta)
+                ChunkItem(file_path=file_path, chunk_index=i, text=ch, metadata_base=meta)
             )
 
     print(f"Всего чанков: {len(all_chunks)}")
@@ -143,19 +141,29 @@ async def main():
     # 2) ПАРАЛЛЕЛЬНО СЧИТАЕМ ЭМБЕДДИНГИ
     # -------------------------------
     semaphore = asyncio.Semaphore(CONCURRENCY)
-    results = []
-
-    tasks = []
-    for item in all_chunks:
-        tasks.append(embed_worker(semaphore, [item], results))
-
     print("Получаю эмбеддинги...")
-    await tqdm.gather(*tasks)
+
+    tasks = [
+        asyncio.create_task(process_chunk_item(semaphore, item))
+        for item in all_chunks
+    ]
+
+    results = []
+    # tqdm здесь обычный синхронный, но работает по мере выполнения корутин
+    for coro in tqdm_sync(
+        asyncio.as_completed(tasks),
+        total=len(tasks),
+        desc="Эмбеддинги",
+        unit="chunk",
+    ):
+        res = await coro
+        if res is not None:
+            results.append(res)
 
     print(f"Эмбеддингов получено: {len(results)}")
 
     # -------------------------------
-    # 3) ДОПОДКЛЮЧАЕМСЯ К PINECONE
+    # 3) ПОДКЛЮЧАЕМСЯ К PINECONE
     # -------------------------------
     print("Подключаюсь к Pinecone...")
     index = get_pinecone_index()
@@ -165,7 +173,7 @@ async def main():
     # 4) ЗАГРУЗКА В PINECONE (БАТЧИ)
     # -------------------------------
     print("Загружаю в Pinecone...")
-    for i in tqdm_sync(range(0, len(results), BATCH_SIZE), unit="batch"):
+    for i in tqdm_sync(range(0, len(results), BATCH_SIZE), unit="batch", desc="Upsert"):
         batch = results[i:i + BATCH_SIZE]
         upsert_with_retry(index, batch)
 
