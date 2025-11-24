@@ -66,7 +66,7 @@ cd LexyPrivateBot
 
 python3 -m venv venv
 source venv/bin/activate  # macOS / Linux
-# venv\Scripts\activate   # Windows
+venv\Scripts\activate   # Windows
 2. Установка зависимостей
 pip install -r requirements.txt
 Настройка переменных окружения
