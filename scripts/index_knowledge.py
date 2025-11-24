@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-from tqdm import tqdm
+from tqdm.asyncio import tqdm
+from tqdm import tqdm as tqdm_sync
 from pinecone.exceptions import PineconeApiException
 
 from app.services.text_extractor import extract_text
@@ -15,9 +16,11 @@ from app.integrations.pinecone_client import get_pinecone_index
 
 DATA_DIR = Path("data/knowledge")
 
-BATCH_SIZE = 50          # сколько векторов шлём за раз в Pinecone
-MAX_RETRIES = 5          # сколько раз пробуем повторить запрос при ошибке
-BASE_DELAY = 2.0         # базовая задержка между ретраями (секунды)
+CHUNK_SIZE = 1800
+BATCH_SIZE = 50
+MAX_RETRIES = 5
+BASE_DELAY = 2.0
+CONCURRENCY = 10      # одновременно 10 запросов к OpenAI
 
 
 @dataclass
@@ -28,51 +31,32 @@ class ChunkItem:
     metadata_base: dict
 
 
-def split_into_chunks(text: str, max_chars: int = 2000) -> List[str]:
-    """
-    Делим текст на куски примерно по max_chars символов.
-    """
+def split_into_chunks(text: str, max_chars: int = CHUNK_SIZE) -> List[str]:
     text = text.strip()
     if len(text) <= max_chars:
         return [text] if text else []
 
-    chunks: List[str] = []
-    start = 0
-    while start < len(text):
-        end = start + max_chars
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        start = end
-
-    return chunks
+    return [
+        text[i:i + max_chars].strip()
+        for i in range(0, len(text), max_chars)
+    ]
 
 
-def _build_metadata(file_path: Path) -> dict:
-    """
-    Эвристика под твои названия файлов.
-    """
+def build_metadata(file_path: Path) -> dict:
     name = file_path.stem
     lower = name.lower()
 
-    if "ksrf" in lower or "decision" in lower or "конституцион" in lower:
+    if "ksrf" in lower or "конституцион" in lower:
         type_ = "КС РФ"
-    elif "обзор судебной практики верховного суда" in lower:
+    elif "обзор судебной практики" in lower:
         type_ = "Обзор ВС РФ"
-    elif "постановление пленума верховного суда" in lower:
+    elif "постановление пленума" in lower:
         type_ = "ПП ВС РФ"
-    elif "mesto_gosudarstvennoy" in lower or "госпошлин" in lower:
-        type_ = "Доктрина"
     else:
         type_ = "Доктрина"
 
-    # Ищем № в названии
-    m = re.search(r"№\s*([0-9,\s/()-]+)", name)
-    if m:
-        number = m.group(1).strip()
-    else:
-        m = re.search(r"\d+", name)
-        number = m.group(0) if m else name
+    m = re.search(r"№\s*([0-9,\s/-]+)", name)
+    number = m.group(1) if m else name
 
     return {
         "type": type_,
@@ -83,156 +67,109 @@ def _build_metadata(file_path: Path) -> dict:
 
 
 def make_vector_id(file_path: Path, chunk_idx: int) -> str:
-    """
-    ASCII-only ID из хэша имени файла + индекса чанка.
-    Pinecone требует ASCII id.
-    """
-    stem = file_path.stem
-    digest = hashlib.md5(stem.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.md5(file_path.stem.encode("utf-8")).hexdigest()[:12]
     return f"{digest}_{chunk_idx}"
 
 
-def upsert_with_retry(index, vectors_batch: List[dict]) -> None:
-    """
-    Отправляет батч векторов в Pinecone с ретраями.
-    """
-    if not vectors_batch:
-        return
-
-    attempt = 0
-    while attempt < MAX_RETRIES:
-        try:
-            index.upsert(vectors=vectors_batch)
-            return
-        except PineconeApiException as e:
-            attempt += 1
-            delay = BASE_DELAY * attempt
-            print(
-                f"\n[WARN] Ошибка Pinecone при upsert (попытка {attempt}/{MAX_RETRIES}): {e}. "
-                f"Повтор через {delay:.1f} сек."
-            )
-            time.sleep(delay)
-        except Exception as e:
-            attempt += 1
-            delay = BASE_DELAY * attempt
-            print(
-                f"\n[WARN] Неожиданная ошибка при upsert (попытка {attempt}/{MAX_RETRIES}): {e}. "
-                f"Повтор через {delay:.1f} сек."
-            )
-            time.sleep(delay)
-
-    print(
-        f"\n[ERROR] Не удалось загрузить батч из {len(vectors_batch)} векторов "
-        f"после {MAX_RETRIES} попыток. Эти векторы будут пропущены. "
-        f"Вы можете перезапустить скрипт позже — upsert идемпотентен."
-    )
-
-
 async def get_embedding_with_retry(text: str) -> Optional[List[float]]:
-    """
-    Обёртка над get_embedding с ретраями на случай проблем с интернетом/лимитами.
-    """
-    attempt = 0
-    while attempt < MAX_RETRIES:
+    for attempt in range(MAX_RETRIES):
         try:
             return await get_embedding(text)
         except Exception as e:
-            attempt += 1
-            delay = BASE_DELAY * attempt
-            print(
-                f"\n[WARN] Ошибка при получении эмбеддинга (попытка {attempt}/{MAX_RETRIES}): {e}. "
-                f"Повтор через {delay:.1f} сек."
-            )
+            delay = BASE_DELAY * (attempt + 1)
+            print(f"[WARN] get_embedding ошибка: {e}, retry через {delay}s")
             await asyncio.sleep(delay)
-
-    print(
-        f"\n[ERROR] Не удалось получить эмбеддинг для чанка "
-        f"после {MAX_RETRIES} попыток. Чанк будет пропущен."
-    )
+    print("[ERROR] эмбеддинг не получен, пропуск чанка.")
     return None
 
 
-async def main() -> None:
-    index = get_pinecone_index()
+def upsert_with_retry(index, batch):
+    for attempt in range(MAX_RETRIES):
+        try:
+            index.upsert(vectors=batch)
+            return
+        except Exception as e:
+            delay = BASE_DELAY * (attempt + 1)
+            print(f"[WARN] Pinecone upsert ошибка: {e}, retry через {delay}s")
+            time.sleep(delay)
 
-    # 1) Собираем все PDF-файлы
-    pdf_files = [
-        p for p in DATA_DIR.rglob("*")
-        if p.is_file() and p.suffix.lower() == ".pdf"
-    ]
+    print(f"[ERROR] batch ({len(batch)}) пропущен.")
 
-    if not pdf_files:
-        print("Нет PDF-файлов в data/knowledge — индексировать нечего.")
-        return
 
-    print(f"Найдено {len(pdf_files)} PDF-файлов для индексации.\n")
+async def embed_worker(semaphore, items, results):
+    async with semaphore:
+        for item in items:
+            emb = await get_embedding_with_retry(item.text)
+            if emb is None:
+                continue
 
-    # 2) Первый проход: читаем файлы, режем на чанки, собираем все ChunkItem в память
-    all_chunks: List[ChunkItem] = []
-
-    for file_path in tqdm(pdf_files, desc="Чтение файлов", unit="файл"):
-        text = extract_text(file_path).strip()
-        if not text:
-            print(f"  ⚠ {file_path} — нет текста (возможно, скан). Пропускаю.")
-            continue
-
-        chunks = split_into_chunks(text, max_chars=1800)
-        if not chunks:
-            print(f"  ⚠ {file_path} — не удалось разбить на чанки. Пропускаю.")
-            continue
-
-        meta_base = _build_metadata(file_path)
-        meta_base["summary"] = text[:700]
-
-        for idx, chunk in enumerate(chunks):
-            all_chunks.append(
-                ChunkItem(
-                    file_path=file_path,
-                    chunk_index=idx,
-                    text=chunk,
-                    metadata_base=meta_base,
-                )
-            )
-
-    if not all_chunks:
-        print("Нет чанков для индексации.")
-        return
-
-    print(f"\nВсего чанков для индексации: {len(all_chunks)}\n")
-
-    # 3) Второй проход: считаем эмбеддинги и шлём в Pinecone с прогресс-баром
-    total_chunks = 0
-    vectors_batch: List[dict] = []
-
-    for item in tqdm(all_chunks, desc="Эмбеддинги + upsert", unit="chunk"):
-        emb = await get_embedding_with_retry(item.text)
-        if emb is None:
-            # чанк пропускаем (ошибка при получении эмбеддинга)
-            continue
-
-        vector_id = make_vector_id(item.file_path, item.chunk_index)
-
-        vectors_batch.append(
-            {
-                "id": vector_id,
+            results.append({
+                "id": make_vector_id(item.file_path, item.chunk_index),
                 "values": emb,
                 "metadata": {
                     **item.metadata_base,
                     "chunk_index": item.chunk_index,
-                },
-            }
-        )
-        total_chunks += 1
+                }
+            })
 
-        if len(vectors_batch) >= BATCH_SIZE:
-            upsert_with_retry(index, vectors_batch)
-            vectors_batch = []
 
-    # Остаток батча
-    if vectors_batch:
-        upsert_with_retry(index, vectors_batch)
+async def main():
+    # -------------------------------
+    # 1) ЧТЕНИЕ PDF + СПЛИТ
+    # -------------------------------
+    pdf_files = [p for p in DATA_DIR.rglob("*.pdf")]
 
-    print(f"\n✅ Индексация завершена. Всего загружено чанков: {total_chunks}")
+    print(f"Найдено файлов: {len(pdf_files)}")
+
+    all_chunks = []
+
+    for file_path in tqdm_sync(pdf_files, desc="Чтение PDF", unit="file"):
+        text = extract_text(file_path).strip()
+        if not text:
+            continue
+
+        chunks = split_into_chunks(text)
+        meta = build_metadata(file_path)
+        meta["summary"] = text[:700]
+
+        for i, ch in enumerate(chunks):
+            all_chunks.append(
+                ChunkItem(file_path, i, ch, meta)
+            )
+
+    print(f"Всего чанков: {len(all_chunks)}")
+
+    # -------------------------------
+    # 2) ПАРАЛЛЕЛЬНО СЧИТАЕМ ЭМБЕДДИНГИ
+    # -------------------------------
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    results = []
+
+    tasks = []
+    for item in all_chunks:
+        tasks.append(embed_worker(semaphore, [item], results))
+
+    print("Получаю эмбеддинги...")
+    await tqdm.gather(*tasks)
+
+    print(f"Эмбеддингов получено: {len(results)}")
+
+    # -------------------------------
+    # 3) ДОПОДКЛЮЧАЕМСЯ К PINECONE
+    # -------------------------------
+    print("Подключаюсь к Pinecone...")
+    index = get_pinecone_index()
+    print("Готово.")
+
+    # -------------------------------
+    # 4) ЗАГРУЗКА В PINECONE (БАТЧИ)
+    # -------------------------------
+    print("Загружаю в Pinecone...")
+    for i in tqdm_sync(range(0, len(results), BATCH_SIZE), unit="batch"):
+        batch = results[i:i + BATCH_SIZE]
+        upsert_with_retry(index, batch)
+
+    print("✅ Индексация завершена")
 
 
 if __name__ == "__main__":
