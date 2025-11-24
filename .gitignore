@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env
+
+# MacOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Byte-compiled
+*.egg-info/
+
+# Logs
+*.log
+
+# Cache
+.cache/
+
+# Local data
+data/
+!data/__init__.py

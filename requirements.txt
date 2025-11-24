@@ -1,0 +1,9 @@
+aiogram>=3.13.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.1
+python-docx>=0.8.11
+pdfplumber>=0.11.0
+pillow>=10.0.0
+openai>=1.40.0
+pinecone>=5.1.0
