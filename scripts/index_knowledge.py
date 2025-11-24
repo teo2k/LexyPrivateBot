@@ -2,8 +2,9 @@ import asyncio
 import hashlib
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from tqdm import tqdm
 from pinecone.exceptions import PineconeApiException
@@ -15,14 +16,21 @@ from app.integrations.pinecone_client import get_pinecone_index
 DATA_DIR = Path("data/knowledge")
 
 BATCH_SIZE = 50          # сколько векторов шлём за раз в Pinecone
-MAX_RETRIES = 5          # сколько раз пробуем повторить upsert при ошибке
+MAX_RETRIES = 5          # сколько раз пробуем повторить запрос при ошибке
 BASE_DELAY = 2.0         # базовая задержка между ретраями (секунды)
+
+
+@dataclass
+class ChunkItem:
+    file_path: Path
+    chunk_index: int
+    text: str
+    metadata_base: dict
 
 
 def split_into_chunks(text: str, max_chars: int = 2000) -> List[str]:
     """
     Делим текст на куски примерно по max_chars символов.
-    Простейший чанкер: для RAG уже достаточно.
     """
     text = text.strip()
     if len(text) <= max_chars:
@@ -43,7 +51,6 @@ def split_into_chunks(text: str, max_chars: int = 2000) -> List[str]:
 def _build_metadata(file_path: Path) -> dict:
     """
     Эвристика под твои названия файлов.
-    Определяем type/number/short_title по имени файла.
     """
     name = file_path.stem
     lower = name.lower()
@@ -77,7 +84,7 @@ def _build_metadata(file_path: Path) -> dict:
 
 def make_vector_id(file_path: Path, chunk_idx: int) -> str:
     """
-    Делаем ASCII-only ID из хэша имени файла + индекса чанка.
+    ASCII-only ID из хэша имени файла + индекса чанка.
     Pinecone требует ASCII id.
     """
     stem = file_path.stem
@@ -88,14 +95,13 @@ def make_vector_id(file_path: Path, chunk_idx: int) -> str:
 def upsert_with_retry(index, vectors_batch: List[dict]) -> None:
     """
     Отправляет батч векторов в Pinecone с ретраями.
-    Если после MAX_RETRIES всё равно ошибка - просто логируем и идём дальше.
-    Повторный запуск скрипта безопасен, т.к. upsert идемпотентен.
     """
+    if not vectors_batch:
+        return
+
     attempt = 0
     while attempt < MAX_RETRIES:
         try:
-            if not vectors_batch:
-                return
             index.upsert(vectors=vectors_batch)
             return
         except PineconeApiException as e:
@@ -115,18 +121,41 @@ def upsert_with_retry(index, vectors_batch: List[dict]) -> None:
             )
             time.sleep(delay)
 
-    # Если дошли сюда - батч так и не залился
     print(
         f"\n[ERROR] Не удалось загрузить батч из {len(vectors_batch)} векторов "
         f"после {MAX_RETRIES} попыток. Эти векторы будут пропущены. "
-        f"Вы можете перезапустить скрипт позже - upsert в Pinecone идемпотентен."
+        f"Вы можете перезапустить скрипт позже — upsert идемпотентен."
     )
+
+
+async def get_embedding_with_retry(text: str) -> Optional[List[float]]:
+    """
+    Обёртка над get_embedding с ретраями на случай проблем с интернетом/лимитами.
+    """
+    attempt = 0
+    while attempt < MAX_RETRIES:
+        try:
+            return await get_embedding(text)
+        except Exception as e:
+            attempt += 1
+            delay = BASE_DELAY * attempt
+            print(
+                f"\n[WARN] Ошибка при получении эмбеддинга (попытка {attempt}/{MAX_RETRIES}): {e}. "
+                f"Повтор через {delay:.1f} сек."
+            )
+            await asyncio.sleep(delay)
+
+    print(
+        f"\n[ERROR] Не удалось получить эмбеддинг для чанка "
+        f"после {MAX_RETRIES} попыток. Чанк будет пропущен."
+    )
+    return None
 
 
 async def main() -> None:
     index = get_pinecone_index()
 
-    # Собираем список PDF-файлов
+    # 1) Собираем все PDF-файлы
     pdf_files = [
         p for p in DATA_DIR.rglob("*")
         if p.is_file() and p.suffix.lower() == ".pdf"
@@ -136,61 +165,74 @@ async def main() -> None:
         print("Нет PDF-файлов в data/knowledge — индексировать нечего.")
         return
 
-    total_chunks = 0
-
     print(f"Найдено {len(pdf_files)} PDF-файлов для индексации.\n")
 
-    # Проходим по файлам с прогресс-баром
-    for file_path in tqdm(pdf_files, desc="Файлы", unit="файл"):
-        print(f"\nОбрабатываю PDF: {file_path}")
+    # 2) Первый проход: читаем файлы, режем на чанки, собираем все ChunkItem в память
+    all_chunks: List[ChunkItem] = []
 
+    for file_path in tqdm(pdf_files, desc="Чтение файлов", unit="файл"):
         text = extract_text(file_path).strip()
         if not text:
-            print("  ⚠ Нет текста — возможно, PDF-скан. Пропускаю.")
+            print(f"  ⚠ {file_path} — нет текста (возможно, скан). Пропускаю.")
             continue
 
         chunks = split_into_chunks(text, max_chars=1800)
         if not chunks:
-            print("  ⚠ Не удалось разбить текст на чанки. Пропускаю.")
+            print(f"  ⚠ {file_path} — не удалось разбить на чанки. Пропускаю.")
             continue
-
-        print(f"  ➜ Разбито на {len(chunks)} чанков")
 
         meta_base = _build_metadata(file_path)
         meta_base["summary"] = text[:700]
 
-        vectors_batch: List[dict] = []
-        # Прогресс по чанкам внутри файла
-        for idx, chunk in enumerate(
-            tqdm(chunks, desc="  Чанки", unit="chunk", leave=False)
-        ):
-            emb = await get_embedding(chunk)
-
-            vector_id = make_vector_id(file_path, idx)
-
-            vectors_batch.append(
-                {
-                    "id": vector_id,
-                    "values": emb,
-                    "metadata": {
-                        **meta_base,
-                        "chunk_index": idx,
-                    },
-                }
+        for idx, chunk in enumerate(chunks):
+            all_chunks.append(
+                ChunkItem(
+                    file_path=file_path,
+                    chunk_index=idx,
+                    text=chunk,
+                    metadata_base=meta_base,
+                )
             )
-            total_chunks += 1
 
-            # Если набрали батч - отправляем с ретраями
-            if len(vectors_batch) >= BATCH_SIZE:
-                upsert_with_retry(index, vectors_batch)
-                vectors_batch = []
+    if not all_chunks:
+        print("Нет чанков для индексации.")
+        return
 
-        # Остаток чанков по файлу
-        if vectors_batch:
+    print(f"\nВсего чанков для индексации: {len(all_chunks)}\n")
+
+    # 3) Второй проход: считаем эмбеддинги и шлём в Pinecone с прогресс-баром
+    total_chunks = 0
+    vectors_batch: List[dict] = []
+
+    for item in tqdm(all_chunks, desc="Эмбеддинги + upsert", unit="chunk"):
+        emb = await get_embedding_with_retry(item.text)
+        if emb is None:
+            # чанк пропускаем (ошибка при получении эмбеддинга)
+            continue
+
+        vector_id = make_vector_id(item.file_path, item.chunk_index)
+
+        vectors_batch.append(
+            {
+                "id": vector_id,
+                "values": emb,
+                "metadata": {
+                    **item.metadata_base,
+                    "chunk_index": item.chunk_index,
+                },
+            }
+        )
+        total_chunks += 1
+
+        if len(vectors_batch) >= BATCH_SIZE:
             upsert_with_retry(index, vectors_batch)
             vectors_batch = []
 
-    print(f"\n✅ Индексация завершена. Всего обработано чанков: {total_chunks}")
+    # Остаток батча
+    if vectors_batch:
+        upsert_with_retry(index, vectors_batch)
+
+    print(f"\n✅ Индексация завершена. Всего загружено чанков: {total_chunks}")
 
 
 if __name__ == "__main__":
