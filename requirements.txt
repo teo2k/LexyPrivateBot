@@ -9,3 +9,4 @@ openai>=1.40.0
 pinecone>=5.1.0
 tqdm==4.67.1
 PyPDF2==3.0.1
+docx2txt==0.9

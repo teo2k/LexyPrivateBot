@@ -1,37 +1,50 @@
 from aiogram import Router, F
 from aiogram.types import Message
+from aiogram import Bot
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-from app.services.file_loader import save_document
 from app.services.analyzer import run_full_analysis
 from app.services.formatter import format_document_analysis
-from app.utils.text import split_text_for_telegram  # 👈 НОВОЕ
+from app.utils.text import split_text_for_telegram
 
 router = Router(name="upload")
 
 
 @router.message(F.document)
 async def handle_document_upload(message: Message) -> None:
-    if not message.document:
+    document = message.document
+    if not document:
         return
 
     await message.answer("Файл получил, начинаю проверку...")
 
-    bot = message.bot
-    user_id = message.from_user.id if message.from_user else 0
+    bot: Bot = message.bot
 
-    # 1. скачиваем файл
-    file_path = await save_document(
-        bot=bot,
-        document=message.document,
-        user_id=user_id,
-    )
+    # 1. Создаем временный файл (без сохранения на диск на постоянной основе)
+    suffix = Path(document.file_name).suffix.lower()
+    if suffix not in {".pdf", ".docx"}:
+        await message.answer("Поддерживаю только PDF и DOCX.")
+        return
 
-    # 2. запускаем анализ
-    analysis = await run_full_analysis(file_path=file_path, topic="госпошлина")
+    with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp_path = Path(tmp.name)
+        await bot.download(document, destination=tmp)
 
-    # 3. форматируем результат
-    text = format_document_analysis(analysis)
+    try:
+        # 2. Запускаем анализ
+        analysis = await run_full_analysis(file_path=tmp_path, topic="госпошлина")
 
-    # 4. режем на части и отправляем по очереди
-    for part in split_text_for_telegram(text):
-        await message.answer(part)
+        # 3. Формируем текст ответа
+        formatted = format_document_analysis(analysis)
+
+        # 4. Режем на части и отправляем
+        for part in split_text_for_telegram(formatted):
+            await message.answer(part)
+
+    finally:
+        # 5. Удаляем временный файл в любом случае
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"[WARN] Не удалось удалить временный файл {tmp_path}: {e}")
